@@ -3473,6 +3473,12 @@ export class PathTracerApp extends EventDispatcher {
 		this.cameraManager.setInteractionManager( this.interactionManager );
 		this.lightManager = new LightManager( this.scene, this._sceneHelpers, this.stages.pathTracer, {
 			onReset: () => this.reset(),
+			// The gizmo stays attached to a removed light and warns every frame it draws.
+			onLightRemoved: light => {
+
+				if ( this.interactionManager?.selectedObject === light ) this.interactionManager.deselect();
+
+			},
 		} );
 		this.goboManager = new GoboManager( this.stages.pathTracer, {
 			onReset: () => this.reset(),

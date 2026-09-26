@@ -286,6 +286,65 @@ describe( 'LightManager', () => {
 
 	} );
 
+	// ── removing lights ──────────────────────────────────────
+
+	describe( 'onLightRemoved', () => {
+
+		let onLightRemoved;
+
+		beforeEach( () => {
+
+			onLightRemoved = vi.fn();
+			manager = new LightManager( scene, sceneHelpers, pathTracer, { onLightRemoved } );
+
+		} );
+
+		it( 'reports a light while it is still in the scene', () => {
+
+			const { uuid } = manager.addLight( 'PointLight' );
+			const light = scene.getObjectByProperty( 'uuid', uuid );
+			light.removeFromParent = () => scene.remove( light );
+			let inSceneWhenReported = false;
+			onLightRemoved.mockImplementation( l => {
+
+				inSceneWhenReported = scene._children.includes( l );
+
+			} );
+
+			manager.removeLight( uuid );
+
+			// A selected light must be let go of before it leaves; the gizmo warned every frame.
+			expect( onLightRemoved ).toHaveBeenCalledWith( light );
+			expect( inSceneWhenReported ).toBe( true );
+
+		} );
+
+		it( 'reports every light that clearLights removes', () => {
+
+			manager.addLight( 'PointLight' );
+			manager.addLight( 'DirectionalLight' );
+			const lights = scene.getObjectsByProperty( 'isLight', true );
+
+			manager.clearLights();
+
+			expect( onLightRemoved ).toHaveBeenCalledTimes( 2 );
+			expect( onLightRemoved.mock.calls.map( c => c[ 0 ] ) ).toEqual( lights );
+
+		} );
+
+		it( 'is dropped on dispose', () => {
+
+			manager.addLight( 'PointLight' );
+
+			manager.dispose();
+
+			expect( onLightRemoved ).not.toHaveBeenCalled();
+			expect( manager._onLightRemoved ).toBeNull();
+
+		} );
+
+	} );
+
 	// ── dispose ──────────────────────────────────────────────
 
 	describe( 'dispose', () => {

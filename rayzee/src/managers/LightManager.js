@@ -17,6 +17,7 @@ export class LightManager extends EventDispatcher {
 	 * @param {import('../Stages/PathTracer.js').PathTracer} pathTracer
 	 * @param {Object} [options]
 	 * @param {Function} [options.onReset] - Callback to reset accumulation after light changes
+	 * @param {Function} [options.onLightRemoved] - Called with each light before it leaves the scene
 	 */
 	constructor( scene, sceneHelpers, pathTracer, options = {} ) {
 
@@ -26,6 +27,7 @@ export class LightManager extends EventDispatcher {
 		this.sceneHelpers = sceneHelpers;
 		this.pathTracer = pathTracer;
 		this._onReset = options.onReset || null;
+		this._onLightRemoved = options.onLightRemoved || null;
 
 	}
 
@@ -108,6 +110,7 @@ export class LightManager extends EventDispatcher {
 		const light = this.scene.getObjectByProperty( 'uuid', uuid );
 		if ( ! light || ! light.isLight ) return false;
 
+		this._onLightRemoved?.( light );
 		this.sceneHelpers.remove( light );
 		if ( light.target ) light.target.removeFromParent();
 		light.removeFromParent();
@@ -277,6 +280,7 @@ export class LightManager extends EventDispatcher {
 
 		if ( this._disposed ) return;
 		this._disposed = true;
+		this._onLightRemoved = null;
 
 		this.sceneHelpers?.clear();
 		this._removeAllLights();
@@ -296,6 +300,7 @@ export class LightManager extends EventDispatcher {
 
 		this.scene.getObjectsByProperty( 'isLight', true ).forEach( light => {
 
+			this._onLightRemoved?.( light );
 			if ( light.target ) this.scene.remove( light.target );
 			this.scene.remove( light );
 
