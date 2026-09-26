@@ -422,9 +422,12 @@ export class OIDNDenoiser extends EventDispatcher {
 
 		this.dispatchEvent( { type: 'loading', message: 'Loading UNet denoiser...' } );
 
-		// Dispose previous instance
 		if ( this.unet ) {
 
+			// A tile already started still writes into the old network once its microtasks run;
+			// disposing under it submitted destroyed buffers.
+			if ( this.state.isDenoising ) this.state.abortController?.abort();
+			await new Promise( resolve => setTimeout( resolve, 0 ) );
 			this.unet.dispose();
 			this.unet = null;
 
