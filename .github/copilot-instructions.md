@@ -128,7 +128,7 @@ Always use `getApp()` from appProxy to access the app instance. Never use store 
 
 ### Denoising Pipeline Coordination
 **Temporal filtering coordination**:
-- ASVGF (real-time) vs OIDN (final quality) - never both simultaneously
+- One denoiser owns the live view (None / EdgeAware / ASVGF / NRD / OIDN); OIDN's final pass on the finished image is a separate switch
 - EdgeAware filtering disabled when ASVGF enabled
 - Quality presets in `ASVGF_QUALITY_PRESETS` (performance/balanced/quality)
 

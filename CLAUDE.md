@@ -595,6 +595,11 @@ guarantees 16 sampled textures per stage.
   `reset( false, { motion: true } )` keep the history; any other reset, including the path tracer
   resetting itself unannounced, drops it. Code that moves a placement calls
   `denoisingManager.notePlacementMoving()` first (`_notePlacementsMoving`) so the history follows it.
+- **OIDN model swaps** (refreshes run the cheap tier, the finished image the chosen one) cost 10-20 ms
+  on oidn-web 0.4.0, and `OIDNDenoiser._fetchWeights` keeps each model's bytes, so a swap never
+  re-downloads. ⚠️ A `[Buffer "outputPass"] used in submit while destroyed` error is **oidn-web's**
+  output pass, not three.js's: a tile's writes land a microtask after it starts, so a UNet must not
+  be disposed under a run in flight — `_loadUNetWeights` aborts it and yields a macrotask first.
 - EdgeAware filtering disabled when ASVGF enabled
 - Quality presets in `ASVGF_QUALITY_PRESETS` (performance/balanced/quality)
 - ⚠️ `Processor/ToneMapGPU.js` is a second implementation of `toneMapToRGBA8` and must stay

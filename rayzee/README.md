@@ -331,6 +331,7 @@ engine.animate()              // Start the render loop
 engine.pause()                // Pause rendering
 engine.resume()               // Resume rendering
 engine.reset()                // Reset accumulation (restart from sample 0)
+engine.reset(false, { motion: true })  // Same, when only placements or geometry moved: keeps OIDN's motion history
 engine.dispose()              // Clean up all resources
 engine.wake()                 // Resume render loop if idle
 ```
@@ -629,6 +630,7 @@ engine.denoisingManager.setAutoExposureParams({ keyValue: 0.18 })
 engine.denoisingManager.setOIDNEnabled(true)
 engine.denoisingManager.setOIDNQuality('high')
 engine.denoisingManager.setStrategy('oidn')              // OIDN owns the live view; see below
+engine.denoisingManager.setTemporalHistory(false)        // live OIDN without the motion history (default on)
 engine.denoisingManager.continuousDenoiseInterval = 250   // cap refreshes at 4/sec (default 8 = uncapped)
 engine.denoisingManager.setUpscalerEnabled(true)
 engine.denoisingManager.setUpscalerScaleFactor(2)         // 2 or 4
@@ -1129,8 +1131,8 @@ switching the final pass on says nothing about the live view. All six combinatio
 | `'none'` | `true` | raw | raw | OIDN |
 | `'asvgf'` | `false` | ASVGF | ASVGF | ASVGF's last frame |
 | `'asvgf'` | `true` | ASVGF | ASVGF | OIDN |
-| `'oidn'` | `false` | raw | OIDN, refreshing | one last refresh |
-| `'oidn'` | `true` | raw | OIDN, refreshing | OIDN, full quality |
+| `'oidn'` | `false` | OIDN, from the motion history | OIDN, refreshing | one last refresh |
+| `'oidn'` | `true` | OIDN, from the motion history | OIDN, refreshing | OIDN, full quality |
 
 `denoiser.enabled` is the union of the two — "OIDN is in use at all", which is what the aux G-buffer
 wiring needs — so read the two decisions back from `denoisingManager.denoiserStrategy` and
@@ -1149,6 +1151,31 @@ wall-clock cadence lands on is not reproducible.
 Leaving the live view raw is not just "denoising off" — it is the only way to see the true noise
 level, which is how you judge whether a render has actually settled. That is row one and row two.
 
+#### While the view moves
+
+Every frame restarts while the camera or an object moves, so a refresh would otherwise denoise one
+fresh sample with its own independent noise, and OIDN's guesses would jump from refresh to refresh
+("boiling"). Instead each restarted frame is blended into a per-pixel **motion history**, reprojected
+into the current view, and the live refreshes denoise that. Measured on a 1.7M-triangle interior at
+512² against 128-sample references: blotchy flicker 2.12 → 0.90 while orbiting and 1.72 → 0.78 moving
+forward, each frame 16 % closer to the clean render, refresh rate unchanged.
+
+- Reflections and a moving object's lighting do not travel with the surface, so shiny pixels and
+  pixels of moved objects keep only about 2 frames of history.
+- When the view stops, the history is blended into the fresh accumulation and fades out over the
+  first 16 samples; the final denoise always reads the plain accumulation.
+- A reset that changes what the scene looks like (a light, a material, a setting) drops the history.
+  Moves go through `reset(true)` (the camera) or `reset(false, { motion: true })`, which the engine's
+  own `updateMeshTransforms`, `refitBVH`, `refitBLASes` and animation playback already use.
+- Moved placements are followed through their matrices when they move through
+  `updateMeshTransforms` or rigid animation; deformed geometry is rejected by its changed depth.
+- Cost, only while OIDN owns the live view: +154 MB of VRAM at 512², +232 MB at 1024², and ~5 % GPU
+  per frame while moving, mostly the `NormalDepth` stage it switches on. At a size the refresh
+  cadence has proven too slow to denoise while moving (the raw render owns the view there), both are
+  released until the size changes.
+
+`setTemporalHistory(false)` returns to denoising the single fresh frame.
+
 #### Quality while it runs vs. quality when it finishes
 
 `oidnQuality` is **the quality of the finished image**. The refreshes along the way use the cheapest
@@ -1164,10 +1191,12 @@ Two constraints shape that table, and neither is optional:
 - **The aux kind must not change mid-render.** `setCleanAuxNormal()` throws away the accumulated
   albedo/normal, so a refresh model that disagreed with the final one would leave the final denoise
   reading an aux buffer one sample deep. That is why the cheap model is `fast-clean` and not `fast`.
-- **Switching models reloads the weights, ~1 s.** So it happens at most once per render, and only
-  once a denoise has actually measured too slow to be a live view (`> 120 ms`). A tier a machine can
-  afford is kept — at 512² that is every tier. The verdict survives a camera move, because the
-  device does not get faster between them; it is re-taken when the tier or the resolution changes.
+- **The cheap model only takes over once a denoise has measured too slow to be a live view
+  (`> 120 ms`).** A tier a machine can afford is kept — at 512² that is every tier. The verdict
+  survives a camera move, because the device does not get faster between them; it is re-taken when
+  the tier or the resolution changes. Past it, each render swaps twice (to the cheap model when the
+  view moves, back for the finished image). A swap costs 10-20 ms on oidn-web 0.4.0, and each model's
+  weights are downloaded once and kept, so a swap never goes back to the network.
 
 #### What paces the refreshes
 

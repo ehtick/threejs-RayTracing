@@ -52,6 +52,8 @@ Rayzee uses an **event-driven pipeline** of modular rendering stages built on We
                               │  ├─LightManager       │
                               │  ├─DenoisingManager   │
                               │  │  ├─OIDNDenoiser    │
+                              │  │  ├─OIDNTemporal-   │
+                              │  │  │  History        │
                               │  │  └─AIUpscaler      │
                               │  └─OverlayManager     │
                               │     └─TileHelper      │
@@ -555,12 +557,15 @@ OverlayManager → outline + scene helpers + HUD (at display resolution)
 | Texture Key | Producer | Consumers | Description |
 |-------------|----------|-----------|-------------|
 | `pathtracer:color` | PathTracer | ASVGF, NRD, EdgeFilter, Compositor | Accumulated path traced color |
-| `pathtracer:normalDepth` | PathTracer / NormalDepth | ASVGF, NRD, EdgeFilter, MotionVector | G-buffer: normals + depth (NormalDepth overrides with its jitter-free version while a denoiser runs) |
-| `pathtracer:shadingNormal` | NormalDepth | EdgeFilter, NRD | Normal-mapped normal; `.w` = material roughness |
+| `pathtracer:normalDepth` | PathTracer / NormalDepth | ASVGF, NRD, EdgeFilter, MotionVector, OIDN motion history | G-buffer: normals + depth (NormalDepth overrides with its jitter-free version while a denoiser runs) |
+| `pathtracer:prevNormalDepth` | NormalDepth | ASVGF, OIDN motion history | The previous traced frame's jitter-free normals + depth |
+| `pathtracer:shadingNormal` | NormalDepth | EdgeFilter, NRD, OIDN motion history | Normal-mapped normal; `.w` = material roughness |
+| `pathtracer:instanceLeaf` | NormalDepth (opt-in, `setInstanceLeafOutput`) | OIDN motion history | r32uint: the hit's transformed TLAS leaf + 1, 0 = none |
 | `pathtracer:albedo` | PathTracer | ASVGF, NRD, BilateralFilter, OIDN | Albedo (denoiser guide); `.w` = NRD-normalized secondary hit distance |
 | `motionVector:screenSpace` | MotionVector | ASVGF, NRD | Screen-space motion (current − previous uv) |
 | `asvgf:output` | ASVGF | Compositor | Denoised color |
 | `nrd:output` | NRD | Compositor | ReBLUR-denoised color (see `docs/NRD_DENOISER.md`) |
+| `oidn:output` | DenoisingManager (OIDN) | Compositor | OIDN's latest denoised picture, held until the next one lands |
 | `variance:output` | Variance | BilateralFilter | Variance map |
 | `asvgf:temporalColor` | ASVGF | - | Temporal accumulation |
 | `edgeFiltering:output` | EdgeFilter | Compositor | Filtered color |
