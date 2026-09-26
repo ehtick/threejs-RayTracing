@@ -199,7 +199,7 @@ export class OIDNDenoiser extends EventDispatcher {
 
 		// WebGPU GPU-native path (no CPU readback for inputs)
 		// backendParams: () => { device: GPUDevice, adapterInfo: GPUAdapterInfo|null }
-		// getGPUTextures: () => { color: GPUTexture, albedo: GPUTexture, normal: GPUTexture }
+		// getGPUTextures: ( { continuous } ) => { color: GPUTexture, albedo: GPUTexture, normal: GPUTexture }
 		this.backendParamsGetter = options.backendParams || null;
 		this.getGPUTextures = options.getGPUTextures || null;
 		this.gpuDevice = null;
@@ -614,7 +614,7 @@ export class OIDNDenoiser extends EventDispatcher {
 
 		}
 
-		const textures = this.getGPUTextures();
+		const textures = this.getGPUTextures( { continuous } );
 		if ( ! textures?.color ) {
 
 			log.warn( 'GPU textures not ready yet' );

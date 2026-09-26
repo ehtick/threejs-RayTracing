@@ -1,7 +1,7 @@
-import { Fn, vec2, vec3, vec4, float, int, uint, uvec2, uniform, min, storage, If,
+import { Fn, vec2, vec3, vec4, float, int, uint, uvec2, uvec4, uniform, min, storage, If,
 	textureStore, workgroupId, localId } from 'three/tsl';
 import { RenderTarget, StorageTexture } from 'three/webgpu';
-import { HalfFloatType, RGBAFormat, NearestFilter, Matrix4, Box2, Vector2 } from 'three';
+import { HalfFloatType, RGBAFormat, RedIntegerFormat, UnsignedIntType, NearestFilter, Matrix4, Box2, Vector2 } from 'three';
 import { RenderStage, StageExecutionMode } from '../Pipeline/RenderStage.js';
 import { MAX_STORAGE_TEXTURE_SIZE } from '../EngineDefaults.js';
 import { Ray, HitInfo, RayTracingMaterial, UVCache } from '../TSL/Struct.js';
@@ -32,7 +32,8 @@ import { computeUVCache, processNormal, processBump, processMetalnessRoughness, 
  * Its .w is the sampled material roughness (NRD's normal+roughness guide).
  *
  * Publishes: pathtracer:normalDepth, pathtracer:prevNormalDepth,
- *            pathtracer:shadingNormal (rgb = shading normal·0.5+0.5, a = roughness)
+ *            pathtracer:shadingNormal (rgb = shading normal·0.5+0.5, a = roughness),
+ *            pathtracer:instanceLeaf (r32uint: the hit's transformed TLAS leaf + 1, 0 = none)
  */
 export class NormalDepth extends RenderStage {
 
@@ -84,6 +85,10 @@ export class NormalDepth extends RenderStage {
 			depthBuffer: false,
 			stencilBuffer: false
 		} );
+
+		// Created only while a consumer asks for it (setInstanceLeafOutput).
+		this._leafStorageTex = null;
+		this._leafRT = null;
 
 		this._srcRegion = new Box2( new Vector2( 0, 0 ), new Vector2( 0, 0 ) );
 
@@ -215,6 +220,7 @@ export class NormalDepth extends RenderStage {
 		const resH = this.resolutionHeight;
 		const outputTex = this._outputStorageTex;
 		const shadingTex = this._shadingStorageTex;
+		const leafTex = this._leafStorageTex;
 
 		const WG_SIZE = 8;
 
@@ -255,6 +261,16 @@ export class NormalDepth extends RenderStage {
 					uvec2( uint( gx ), uint( gy ) ),
 					result
 				).toWriteOnly();
+
+				if ( leafTex ) {
+
+					textureStore(
+						leafTex,
+						uvec2( uint( gx ), uint( gy ) ),
+						uvec4( uint( hit.instanceLeaf.add( 1 ) ), 0, 0, 0 )
+					).toWriteOnly();
+
+				}
 
 				// Shading normal: perturb the geometric normal by the normal/bump map
 				// from the SAME hit (deterministic UV → jitter-free). Miss → geo default.
@@ -339,6 +355,7 @@ export class NormalDepth extends RenderStage {
 			context.setTexture( 'pathtracer:normalDepth', currentRT.texture );
 			context.setTexture( 'pathtracer:prevNormalDepth', currentRT.texture );
 			context.setTexture( 'pathtracer:shadingNormal', this._shadingRT.texture );
+			this._publishLeaf( context );
 			return;
 
 		}
@@ -367,6 +384,7 @@ export class NormalDepth extends RenderStage {
 		this._srcRegion.max.set( writeRT.width, writeRT.height );
 		this.renderer.copyTextureToTexture( this._outputStorageTex, writeRT.texture, this._srcRegion );
 		this.renderer.copyTextureToTexture( this._shadingStorageTex, this._shadingRT.texture, this._srcRegion );
+		if ( this._leafRT ) this.renderer.copyTextureToTexture( this._leafStorageTex, this._leafRT.texture, this._srcRegion );
 
 		// First dispatch: seed prev from current so ASVGF doesn't see false
 		// disocclusion on frame 1.
@@ -380,6 +398,7 @@ export class NormalDepth extends RenderStage {
 		context.setTexture( 'pathtracer:normalDepth', writeRT.texture );
 		context.setTexture( 'pathtracer:prevNormalDepth', prevRT.texture );
 		context.setTexture( 'pathtracer:shadingNormal', this._shadingRT.texture );
+		this._publishLeaf( context );
 
 		this._dirty = false;
 
@@ -391,6 +410,7 @@ export class NormalDepth extends RenderStage {
 
 		this._outputStorageTex?.dispose();
 		this._shadingStorageTex?.dispose();
+		this._leafStorageTex?.dispose();
 		this.reset();
 		// The textures backing the ping-pong are gone, so the prev-frame G-buffer is too.
 		this._hasHistory = false;
@@ -417,6 +437,13 @@ export class NormalDepth extends RenderStage {
 		this._rtB.texture.needsUpdate = true;
 		this._shadingRT.setSize( width, height );
 		this._shadingRT.texture.needsUpdate = true;
+		if ( this._leafRT ) {
+
+			this._leafRT.setSize( width, height );
+			this._leafRT.texture.needsUpdate = true;
+
+		}
+
 		this._hasHistory = false;
 		this.resolutionWidth.value = width;
 		this.resolutionHeight.value = height;
@@ -451,7 +478,69 @@ export class NormalDepth extends RenderStage {
 
 		this._outputStorageTex = mk();
 		this._shadingStorageTex = mk();
+		if ( this._leafStorageTex ) {
+
+			this._leafStorageTex.dispose();
+			this._leafStorageTex = this._makeLeafStorage();
+
+		}
+
 		this._computeBuilt = false;
+
+	}
+
+	/**
+	 * Whether to write `pathtracer:instanceLeaf` (the hit's transformed TLAS leaf + 1, 0 = none).
+	 * Off by default: it costs a full-reserve texture, and changing it rebuilds the kernel.
+	 */
+	setInstanceLeafOutput( enabled ) {
+
+		enabled = !! enabled;
+		if ( enabled === !! this._leafStorageTex ) return;
+
+		this._computeNode?.dispose();
+		this._computeNode = null;
+		this._computeBuilt = false;
+		this._dirty = true;
+
+		if ( enabled ) {
+
+			this._leafStorageTex = this._makeLeafStorage();
+			this._leafRT = new RenderTarget( this._rtA.width, this._rtA.height, {
+				type: UnsignedIntType,
+				format: RedIntegerFormat,
+				minFilter: NearestFilter,
+				magFilter: NearestFilter,
+				depthBuffer: false,
+				stencilBuffer: false
+			} );
+
+		} else {
+
+			this._leafStorageTex.dispose();
+			this._leafRT.dispose();
+			this._leafStorageTex = null;
+			this._leafRT = null;
+
+		}
+
+	}
+
+	_publishLeaf( context ) {
+
+		if ( this._leafRT ) context.setTexture( 'pathtracer:instanceLeaf', this._leafRT.texture );
+		else if ( context.getTexture( 'pathtracer:instanceLeaf' ) ) context.removeTexture( 'pathtracer:instanceLeaf' );
+
+	}
+
+	_makeLeafStorage() {
+
+		const t = new StorageTexture( MAX_STORAGE_TEXTURE_SIZE, MAX_STORAGE_TEXTURE_SIZE );
+		t.type = UnsignedIntType;
+		t.format = RedIntegerFormat;
+		t.minFilter = NearestFilter;
+		t.magFilter = NearestFilter;
+		return t;
 
 	}
 
@@ -461,6 +550,8 @@ export class NormalDepth extends RenderStage {
 		this._outputStorageTex?.dispose();
 		this._shadingStorageTex?.dispose();
 		this._shadingRT?.dispose();
+		this._leafStorageTex?.dispose();
+		this._leafRT?.dispose();
 		this._rtA?.dispose();
 		this._rtB?.dispose();
 

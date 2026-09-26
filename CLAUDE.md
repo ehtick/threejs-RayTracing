@@ -580,6 +580,21 @@ guarantees 16 sampled textures per stage.
 - A **final render suspends the live refresh** (`setCadenceSuspended`, first statement of
   `configureForMode`): it shows its own accumulation and denoises once at the end. Leaving it running
   denoised the image twice and raced the renderer's output-pass rebuild.
+- **OIDN motion history** (`Passes/OIDNTemporalHistory.js`, `oidnTemporalHistory`, default on): while
+  OIDN owns the live view, each restarted frame is blended into a reprojected per-pixel history and
+  live refreshes denoise that instead of one fresh sample (independent 1-spp inputs are what boils).
+  It needs the NormalDepth stage (jitter-free depth, roughness, and `pathtracer:instanceLeaf`, which
+  NormalDepth writes only when `setInstanceLeafOutput( true )`). It is dropped, with NormalDepth, at a
+  size the cadence has proven too slow to denoise while moving (`_movingHopeless`). Shiny
+  pixels and pixels of moved objects keep ~2 frames: reflections and a moving object's lighting do
+  not follow the surface, and following a rotating object with a long history measured worse. Still
+  frames merge the history in, fading out over 16 samples; the final denoise always reads the plain
+  accumulation. ⚠️ Each pixel takes ONE history pixel and shared picks split their length: bilinear
+  history, or copies, is correlated noise and OIDN keeps it as grain. ⚠️ Clamping history to the
+  noisy frame's neighbourhood darkens the image — don't. `reset( true )` and
+  `reset( false, { motion: true } )` keep the history; any other reset, including the path tracer
+  resetting itself unannounced, drops it. Code that moves a placement calls
+  `denoisingManager.notePlacementMoving()` first (`_notePlacementsMoving`) so the history follows it.
 - EdgeAware filtering disabled when ASVGF enabled
 - Quality presets in `ASVGF_QUALITY_PRESETS` (performance/balanced/quality)
 - ⚠️ `Processor/ToneMapGPU.js` is a second implementation of `toneMapToRGBA8` and must stay

@@ -198,6 +198,8 @@ export const ENGINE_DEFAULTS = {
 	// value only governs where a denoise is cheap. 8 ms measured 31 refreshes/sec at 512² at an
 	// unchanged sample rate; 50 ms measured 18/sec for nothing in return.
 	continuousDenoiseInterval: 8,
+	// While the view moves, feed OIDN the reprojected history of restarted frames, not one sample.
+	oidnTemporalHistory: true,
 
 	enableUpscaler: false,
 	upscalerScale: 2,
