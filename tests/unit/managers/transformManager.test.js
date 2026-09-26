@@ -127,6 +127,7 @@ vi.mock( 'three', async ( importOriginal ) => {
 
 } );
 
+import { DirectionalLight, SpotLight, Vector3 } from 'three';
 import { TransformManager } from '@/core/managers/TransformManager.js';
 import { EngineEvents } from '@/core/EngineEvents.js';
 
@@ -378,6 +379,68 @@ describe( 'TransformManager', () => {
 			tm.controls._fire( 'dragging-changed', { value: false } );
 
 			expect( app.updateMeshTransforms ).not.toHaveBeenCalled();
+
+		} );
+
+	} );
+
+	describe( 'moving a light', () => {
+
+		function drag( light, to ) {
+
+			tm.controls._fire( 'dragging-changed', { value: true } );
+			light.position.copy( to );
+			tm.controls._fire( 'objectChange', {} );
+			tm.controls._fire( 'dragging-changed', { value: false } );
+
+		}
+
+		beforeEach( () => {
+
+			app.lightManager = { updateLights: vi.fn() };
+			tm.controls.mode = 'translate';
+
+		} );
+
+		it( 'swings a sun towards its target instead of carrying the target along', () => {
+
+			const sun = new DirectionalLight();
+			sun.position.set( 1, 1, 1 );
+			tm.attach( sun );
+
+			drag( sun, new Vector3( - 3, 2, 0 ) );
+
+			// A sun is only a direction; carrying the target kept the shadows where they were.
+			expect( sun.target.position.toArray() ).toEqual( [ 0, 0, 0 ] );
+			expect( app.lightManager.updateLights ).toHaveBeenCalled();
+
+		} );
+
+		it( 'rotates a moved sun from its new direction', () => {
+
+			const sun = new DirectionalLight();
+			sun.position.set( 1, 1, 1 );
+			tm.attach( sun );
+
+			drag( sun, new Vector3( - 3, 2, 0 ) );
+
+			const aim = new Vector3( 0, 0, - 1 ).applyQuaternion( sun.quaternion );
+			const toTarget = sun.target.position.clone().sub( sun.position ).normalize();
+			expect( aim.distanceTo( toTarget ) ).toBeLessThan( 1e-6 );
+			expect( tm._lightTargetDistance ).toBeCloseTo( Math.sqrt( 13 ), 6 );
+
+		} );
+
+		it( 'carries a spot light\'s target along so its aim holds', () => {
+
+			const spot = new SpotLight();
+			spot.position.set( 0, 2, 0 );
+			spot.target.position.set( 0, 0, 0 );
+			tm.attach( spot );
+
+			drag( spot, new Vector3( 1, 2, 3 ) );
+
+			expect( spot.target.position.toArray() ).toEqual( [ 1, 0, 3 ] );
 
 		} );
 

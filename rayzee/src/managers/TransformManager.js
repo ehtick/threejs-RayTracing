@@ -77,20 +77,7 @@ export class TransformManager {
 		// rotate mode starts from the true current direction instead of identity.
 		if ( object.isLight && object.target ) {
 
-			const forward = object.target.position.clone().sub( object.position );
-			const distance = forward.length();
-
-			if ( distance > 1e-4 ) {
-
-				object.quaternion.setFromUnitVectors( FORWARD, forward.normalize() );
-				this._lightTargetDistance = distance;
-
-			} else {
-
-				this._lightTargetDistance = 1;
-
-			}
-
+			this._syncLightAim( object );
 			this._lastLightPosition = object.position.clone();
 
 		}
@@ -233,9 +220,11 @@ export class TransformManager {
 
 	/**
 	 * Called every gizmo move while a light is attached. Translate mode carries
-	 * `.target` along by the same delta (so moving a light doesn't silently
-	 * swing its aim); rotate mode recomputes `.target` from the light's
-	 * quaternion at a fixed distance (so rotating actually steers the beam/sun).
+	 * a spot light's `.target` along by the same delta (so moving it doesn't
+	 * silently swing its aim) but leaves a sun's in place: a sun is only a
+	 * direction, so moving it must swing that, as the Lights panel's Position
+	 * does. Rotate mode recomputes `.target` from the light's quaternion at a
+	 * fixed distance (so rotating actually steers the beam/sun).
 	 * Also resyncs GPU light buffers + the visible SceneHelpers gizmo live.
 	 */
 	_syncLightDuringDrag() {
@@ -246,7 +235,7 @@ export class TransformManager {
 
 			const mode = this._controls.mode;
 
-			if ( mode === 'translate' && this._lastLightPosition ) {
+			if ( mode === 'translate' && this._lastLightPosition && ! light.isDirectionalLight ) {
 
 				const delta = this._tempForward.copy( light.position ).sub( this._lastLightPosition );
 				light.target.position.add( delta );
@@ -271,12 +260,19 @@ export class TransformManager {
 	/**
 	 * Called once on drag end while a light is attached. Bakes RectAreaLight
 	 * scale into width/height (the serializer also reads scale live, but the
-	 * Lights panel sliders are the source of truth for size) and does a final
-	 * GPU/helper resync.
+	 * Lights panel sliders are the source of truth for size), re-aims a moved
+	 * sun's quaternion so rotate mode starts from its new direction, and does a
+	 * final GPU/helper resync.
 	 */
 	_finalizeLightTransform() {
 
 		const light = this._attached;
+
+		if ( light.isDirectionalLight && light.target && this._controls.mode === 'translate' ) {
+
+			this._syncLightAim( light );
+
+		}
 
 		if ( light.isRectAreaLight && ( light.scale.x !== 1 || light.scale.y !== 1 ) ) {
 
@@ -287,6 +283,28 @@ export class TransformManager {
 		}
 
 		this._app.lightManager?.updateLights();
+
+	}
+
+	/**
+	 * Point the light's quaternion at its `.target` and record the distance, so
+	 * rotate mode steers from the true current direction instead of identity.
+	 */
+	_syncLightAim( light ) {
+
+		const forward = this._tempForward.copy( light.target.position ).sub( light.position );
+		const distance = forward.length();
+
+		if ( distance > 1e-4 ) {
+
+			light.quaternion.setFromUnitVectors( FORWARD, forward.normalize() );
+			this._lightTargetDistance = distance;
+
+		} else {
+
+			this._lightTargetDistance = 1;
+
+		}
 
 	}
 
