@@ -58,7 +58,7 @@ When evaluating changes:
 
 3. **Compositor Fallback Chain** — Priority: `bloom > edgeFiltering > bilateralFiltering > asvgf > pathtracer:color`. Enabled stages publishing dark output override raw path tracer.
 
-4. **Denoiser Coordination** — ASVGF (real-time) vs OIDN (final quality) must never run simultaneously. EdgeAware filtering disabled when ASVGF enabled.
+4. **Denoiser Coordination** — exactly one denoiser owns the live view (None / EdgeAware / ASVGF / NRD / OIDN); OIDN's final pass on the finished image is a separate switch. EdgeAware filtering disabled when ASVGF enabled.
 
 5. **Rendering Modes** — Interactive (low quality, real-time), Final (high quality, tiled), Results (paused). Mode switching batch-updates uniforms and resets pipeline.
 

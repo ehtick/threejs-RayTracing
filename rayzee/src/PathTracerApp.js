@@ -447,6 +447,7 @@ export class PathTracerApp extends EventDispatcher {
 			}
 
 			this.pipeline.render();
+			this.denoisingManager?.afterTrace();
 
 			if ( ! this.stages.pathTracer.isComplete ) {
 
@@ -567,8 +568,15 @@ export class PathTracerApp extends EventDispatcher {
 	/**
 	 * Resets the accumulation buffer.
 	 * @param {boolean} soft - When true, preserves ASVGF temporal history
+	 * @param {Object} [options]
+	 * @param {boolean} [options.motion] - only object placements or geometry moved; keeps the OIDN
+	 *   motion history, which rejects what moved per pixel
 	 */
-	reset( soft = false ) {
+	reset( soft = false, { motion = false } = {} ) {
+
+		// Objects moving is the view changing, as far as the live denoiser's refresh cadence goes.
+		if ( motion ) this.stages.pathTracer?.noteViewChanged();
+		this.denoisingManager?.beforeReset( { keepHistory: soft || motion } );
 
 		if ( this.pipeline ) {
 
@@ -581,6 +589,8 @@ export class PathTracerApp extends EventDispatcher {
 			}
 
 		}
+
+		this.denoisingManager?.afterReset();
 
 		// Whatever is on screen stays until its replacement is ready, including while the camera
 		// moves: the denoising manager decides, since only it knows something is coming.
@@ -1617,7 +1627,7 @@ export class PathTracerApp extends EventDispatcher {
 
 		this.stages.pathTracer.updateTriangleData( this._sdf.triangles );
 		this.stages.pathTracer.updateBVHData( this._sdf.bvh );
-		this.reset();
+		this.reset( false, { motion: true } );
 
 		return result;
 
@@ -1639,7 +1649,7 @@ export class PathTracerApp extends EventDispatcher {
 
 		const { triRanges, bvhRanges } = this._sdf.computeBLASDirtyRanges( affectedMeshIndices );
 		this.stages.pathTracer.updateBufferRanges( triRanges, bvhRanges );
-		this.reset();
+		this.reset( false, { motion: true } );
 
 		// Kick off background rebuild for optimal SAH quality
 		this._sdf.scheduleBackgroundRebuild( affectedMeshIndices, ( meshIndex ) => {
@@ -1648,7 +1658,7 @@ export class PathTracerApp extends EventDispatcher {
 			// re-upload here is gigabytes on a large scene, for one mesh's worth of change.
 			const dirty = this._sdf.computeBLASDirtyRanges( [ meshIndex ] );
 			this.stages.pathTracer.updateBufferRanges( dirty.triRanges, dirty.bvhRanges );
-			this.reset();
+			this.reset( false, { motion: true } );
 
 		} );
 
@@ -1664,6 +1674,7 @@ export class PathTracerApp extends EventDispatcher {
 
 		if ( meshIndices.length > 0 ) {
 
+			this._notePlacementsMoving( meshIndices );
 			this._sdf.updateMeshTransforms( meshIndices );
 			this.stages.pathTracer?.updateBufferRanges( [], [ this._sdf.computeTLASDirtyRange() ] );
 			if ( this._sdf.movesEmitters( meshIndices ) ) {
@@ -1689,7 +1700,24 @@ export class PathTracerApp extends EventDispatcher {
 
 		if ( cameras.length > 0 && this._followAnimatedCamera( cameras ) ) changed = true;
 
-		if ( changed ) this.reset();
+		if ( changed ) this.reset( false, { motion: true } );
+
+	}
+
+	/** @private */
+	_notePlacementsMoving( meshIndices ) {
+
+		const dm = this.denoisingManager;
+		const table = this._sdf?.instanceTable;
+		if ( ! dm?.historyActive || ! table ) return;
+
+		for ( const meshIndex of meshIndices ) {
+
+			const run = table.placementRunOf( meshIndex );
+			if ( ! run ) continue;
+			for ( let p = run.start; p < run.start + run.count; p ++ ) dm.notePlacementMoving( table.tlasLeafIndex[ p ], table.world, p * 16 );
+
+		}
 
 	}
 
@@ -1758,10 +1786,11 @@ export class PathTracerApp extends EventDispatcher {
 	 */
 	updateMeshTransforms( meshIndices ) {
 
+		this._notePlacementsMoving( meshIndices );
 		const result = this._sdf.updateMeshTransforms( meshIndices );
 
 		this.stages.pathTracer.updateBufferRanges( [], [ this._sdf.computeTLASDirtyRange() ] );
-		this.reset();
+		this.reset( false, { motion: true } );
 
 		return result;
 

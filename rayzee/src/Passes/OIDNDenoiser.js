@@ -7,16 +7,16 @@ const log = createLogger( 'oidn' );
 // The tile alignment oidn-web's own fitTileDimension uses (its tileScheduler.js).
 const OIDN_TILE_ALIGNMENT = 16;
 
-let _initUNetFromURL = null;
-async function getInitUNetFromURL() {
+let _initUNetFromBuffer = null;
+async function getInitUNetFromBuffer() {
 
-	if ( ! _initUNetFromURL ) {
+	if ( ! _initUNetFromBuffer ) {
 
-		_initUNetFromURL = ( await import( 'oidn-web' ) ).initUNetFromURL;
+		_initUNetFromBuffer = ( await import( 'oidn-web' ) ).initUNetFromBuffer;
 
 	}
 
-	return _initUNetFromURL;
+	return _initUNetFromBuffer;
 
 }
 
@@ -199,7 +199,7 @@ export class OIDNDenoiser extends EventDispatcher {
 
 		// WebGPU GPU-native path (no CPU readback for inputs)
 		// backendParams: () => { device: GPUDevice, adapterInfo: GPUAdapterInfo|null }
-		// getGPUTextures: () => { color: GPUTexture, albedo: GPUTexture, normal: GPUTexture }
+		// getGPUTextures: ( { continuous } ) => { color: GPUTexture, albedo: GPUTexture, normal: GPUTexture }
 		this.backendParamsGetter = options.backendParams || null;
 		this.getGPUTextures = options.getGPUTextures || null;
 		this.gpuDevice = null;
@@ -263,6 +263,8 @@ export class OIDNDenoiser extends EventDispatcher {
 
 		this.currentTZAUrl = null;
 		this.unet = null;
+		// url → Promise<ArrayBuffer>, so a tier swap never downloads the model again.
+		this._weights = new Map();
 		// A start() requested while the UNet is still loading is deferred here and fired
 		// once loading finishes, instead of being silently dropped.
 		this._pendingStart = false;
@@ -420,9 +422,12 @@ export class OIDNDenoiser extends EventDispatcher {
 
 		this.dispatchEvent( { type: 'loading', message: 'Loading UNet denoiser...' } );
 
-		// Dispose previous instance
 		if ( this.unet ) {
 
+			// A tile already started still writes into the old network once its microtasks run;
+			// disposing under it submitted destroyed buffers.
+			if ( this.state.isDenoising ) this.state.abortController?.abort();
+			await new Promise( resolve => setTimeout( resolve, 0 ) );
 			this.unet.dispose();
 			this.unet = null;
 
@@ -439,8 +444,8 @@ export class OIDNDenoiser extends EventDispatcher {
 
 		}
 
-		const initFn = await getInitUNetFromURL();
-		this.unet = await initFn( tzaUrl, backendParams, {
+		const initFn = await getInitUNetFromBuffer();
+		this.unet = await initFn( await this._fetchWeights( tzaUrl ), backendParams, {
 			aux: true,
 			hdr: true,
 			maxTileSize: tileSize,
@@ -453,6 +458,26 @@ export class OIDNDenoiser extends EventDispatcher {
 		this._activeTileSize = tileSize;
 		this.dispatchEvent( { type: 'loaded' } );
 		log.debug( 'UNet weights loaded:', tzaUrl );
+
+	}
+
+	_fetchWeights( url ) {
+
+		let bytes = this._weights.get( url );
+		if ( ! bytes ) {
+
+			bytes = fetch( url ).then( res => {
+
+				if ( ! res.ok ) throw new Error( `HTTP ${ res.status } fetching ${ url }` );
+				return res.arrayBuffer();
+
+			} );
+			bytes.catch( () => this._weights.delete( url ) );
+			this._weights.set( url, bytes );
+
+		}
+
+		return bytes;
 
 	}
 
@@ -614,7 +639,7 @@ export class OIDNDenoiser extends EventDispatcher {
 
 		}
 
-		const textures = this.getGPUTextures();
+		const textures = this.getGPUTextures( { continuous } );
 		if ( ! textures?.color ) {
 
 			log.warn( 'GPU textures not ready yet' );
@@ -1253,6 +1278,7 @@ export class OIDNDenoiser extends EventDispatcher {
 
 		// Clear references
 		this.unet = null;
+		this._weights.clear();
 		this.state.abortController = null;
 
 		// Remove all event listeners

@@ -1,5 +1,6 @@
-import { EventDispatcher } from 'three';
+import { EventDispatcher, Matrix4 } from 'three';
 import { OIDNDenoiser } from '../Passes/OIDNDenoiser.js';
+import { OIDNTemporalHistory } from '../Passes/OIDNTemporalHistory.js';
 import { AIUpscaler } from '../Passes/AIUpscaler.js';
 import { EngineEvents } from '../EngineEvents.js';
 import { createLogger } from '../utils/Logger.js';
@@ -72,6 +73,11 @@ const INTERACTION_HOPELESS_FACTOR = 3;
 // comes back. Counted in runs, not milliseconds: the loop stops while a finished render sits on
 // screen, so any clock would read a perfectly good frame as abandoned the moment it woke.
 const HELD_FRAME_MAX_FAILURES = 3;
+
+// Still samples after which the motion history no longer helps; it fades out linearly until then.
+const HISTORY_HANDOFF_SAMPLES = 16;
+
+const historyFade = ( samples ) => Math.max( 0, 1 - samples / HISTORY_HANDOFF_SAMPLES );
 
 /**
  * Orchestrates all denoising, post-processing, and AI upscaling:
@@ -151,6 +157,20 @@ export class DenoisingManager extends EventDispatcher {
 		this._onPostProcessRefresh = null;
 		this._onDisplayRefresh = null;
 
+		this.temporalHistory = DEFAULT_STATE.oidnTemporalHistory;
+		this._history = null;
+		// Stale after a scene-changing reset, or one the app did not announce (material/env edits).
+		this._historyDirty = true;
+		this._knownResetCount = 0;
+		this._seenTracedFrames = 0;
+		this._viewProj = new Matrix4();
+		this._historyCamera = { world: null, projInv: null, viewProj: null };
+		// TLAS leaf → { world, offset, prev }: placements moved since the last traced frame.
+		this._movedPlacements = new Map();
+		this._movedUpload = { count: 0, leaves: new Uint32Array( 0 ), toPrev: new Float32Array( 0 ) };
+		this._matA = new Matrix4();
+		this._matB = new Matrix4();
+
 		// Resolution tracking — used for canvas restoration on reset
 		this._lastRenderWidth = 0;
 		this._lastRenderHeight = 0;
@@ -211,6 +231,7 @@ export class DenoisingManager extends EventDispatcher {
 		this._holdWhileMoving = null;
 		this._movingDenoiseMs.length = 0;
 		this._movingHopeless = false;
+		this._historyDirty = true;
 		// A run in flight was sized for the old resolution and setSize rebuilds the network under
 		// it. Resets no longer cancel a run while its frame is on screen, so this has to.
 		this.denoiser?.abort();
@@ -229,6 +250,7 @@ export class DenoisingManager extends EventDispatcher {
 		}
 
 		this.upscaler?.setBaseSize( width, height );
+		this._syncGBufferStages();
 
 	}
 
@@ -273,9 +295,11 @@ export class DenoisingManager extends EventDispatcher {
 				adapterInfo: null
 			} ),
 
-			getGPUTextures: () => {
+			getGPUTextures: ( { continuous = false } = {} ) => {
 
 				if ( ! pt?.storageTextures?.readTarget ) return null;
+				const history = continuous ? this._historyTextures() : null;
+				if ( history ) return history;
 				const readTextures = pt.storageTextures.getReadTextures();
 				const { backend } = this.renderer;
 				return {
@@ -534,8 +558,9 @@ export class DenoisingManager extends EventDispatcher {
 		const mv = s.motionVector;
 
 		const motionNeeded = this.requiresMotionVectors;
-		// pathtracer:normalDepth consumed by ASVGF, NRD, EdgeFilter, BilateralFilter
-		const normalNeeded = motionNeeded || !! ( s.edgeFilter?.enabled || s.bilateralFilter?.enabled );
+		// pathtracer:normalDepth consumed by ASVGF, NRD, EdgeFilter, BilateralFilter, the OIDN history
+		const normalNeeded = motionNeeded || this.historyWanted || !! ( s.edgeFilter?.enabled || s.bilateralFilter?.enabled );
+		if ( ! this.historyWanted ) this._releaseHistory();
 
 		if ( nd ) {
 
@@ -543,6 +568,7 @@ export class DenoisingManager extends EventDispatcher {
 			// (not the stale static fast-path) and seeds prev = current.
 			if ( normalNeeded && ! nd.enabled ) nd.reset();
 			nd.enabled = normalNeeded;
+			nd.setInstanceLeafOutput?.( this.historyWanted );
 
 		}
 
@@ -630,7 +656,12 @@ export class DenoisingManager extends EventDispatcher {
 		const best = this.movingCostMs;
 		const seen = this._movingDenoiseMs.length;
 
-		if ( best > INTERACTION_HOLD_BUDGET_MS * INTERACTION_HOPELESS_FACTOR ) this._movingHopeless = true;
+		if ( best > INTERACTION_HOLD_BUDGET_MS * INTERACTION_HOPELESS_FACTOR ) {
+
+			this._movingHopeless = true;
+			this._syncGBufferStages();
+
+		}
 
 		// One reading is a warm-up; two that are both over budget are the answer.
 		const affordable = ! this._movingHopeless && ( seen < 2 || best <= INTERACTION_HOLD_BUDGET_MS );
@@ -781,6 +812,7 @@ export class DenoisingManager extends EventDispatcher {
 	setCadenceSuspended( suspended ) {
 
 		this._cadenceSuspended = !! suspended;
+		this._historyDirty = true;
 		if ( ! this._cadenceSuspended ) return;
 
 		// The accumulation is what a final render shows; a held preview frame would otherwise sit
@@ -814,6 +846,221 @@ export class DenoisingManager extends EventDispatcher {
 	_resetCadence() {
 
 		this._lastCadenceSamples = 0;
+
+	}
+
+	// ── Motion history (OIDN live view) ──────────────────────────
+
+	/** Feeds OIDN the reprojected history of restarted frames while the view moves. */
+	setTemporalHistory( enabled ) {
+
+		this.temporalHistory = !! enabled;
+		this._syncGBufferStages();
+
+	}
+
+	// Not at a size proven too slow to denoise while moving: the raw render owns the view there.
+	get historyWanted() {
+
+		return this.temporalHistory && this.continuousDenoise && !! this.denoiser?.enabled && ! this._movingHopeless;
+
+	}
+
+	get historyActive() {
+
+		const pt = this._stages.pathTracer;
+		return this.historyWanted && ! this._cadenceSuspended && !! this._stages.normalDepth?.enabled
+			&& ( pt?.uniforms?.get( 'cameraProjection' )?.value ?? 0 ) === 0
+			&& ! ( pt?.visMode?.value > 0 );
+
+	}
+
+	/**
+	 * Called by the app before each of its resets, while the accumulation still exists.
+	 * @param {Object} [options]
+	 * @param {boolean} [options.keepHistory] - only the view or object placements changed
+	 */
+	beforeReset( { keepHistory = false } = {} ) {
+
+		const pt = this._stages.pathTracer;
+		if ( ! pt || ! this.historyActive ) return;
+
+		const unannounced = pt.resetCount !== this._knownResetCount;
+		if ( ! keepHistory || ( unannounced && pt.frameCount < 2 ) ) {
+
+			this._historyDirty = true;
+			return;
+
+		}
+
+		// A move that starts from a still image starts from that image, not from one sample.
+		if ( pt.frameCount < 2 ) return;
+		const src = this._historyInputs();
+		if ( ! src ) return;
+		this._ensureHistory().merge( src, pt.frameCount, this._historyCameraNow(), {
+			commit: true,
+			keepHistory: ! this._historyDirty && ! unannounced,
+			historyScale: historyFade( pt.frameCount ),
+		} );
+		this._historyDirty = false;
+
+	}
+
+	/** Called by the app right after its own resets, so they are not taken for unannounced ones. */
+	afterReset() {
+
+		this._knownResetCount = this._stages.pathTracer?.resetCount ?? 0;
+
+	}
+
+	/** Called after every render-loop tick that ran the pipeline. */
+	afterTrace() {
+
+		const pt = this._stages.pathTracer;
+		if ( ! pt || pt.tracedFrames === this._seenTracedFrames ) return;
+		this._seenTracedFrames = pt.tracedFrames;
+
+		if ( pt.resetCount !== this._knownResetCount ) {
+
+			this._historyDirty = true;
+			this._knownResetCount = pt.resetCount;
+
+		}
+
+		// Accumulating: the history holds still and is merged in when a refresh starts.
+		if ( ! this.historyActive || pt.frame.value !== 0 ) {
+
+			this._movedPlacements.clear();
+			return;
+
+		}
+
+		const src = this._historyInputs();
+		if ( ! src ) {
+
+			this._movedPlacements.clear();
+			this._historyDirty = true;
+			return;
+
+		}
+
+		const history = this._ensureHistory();
+		if ( this._historyDirty ) history.invalidate();
+		history.accumulate( src, this._historyCameraNow(), this._takeMovedPlacements() );
+		this._historyDirty = false;
+
+	}
+
+	/**
+	 * Records a placement's transform before it changes, so the history can follow the object.
+	 * @param {number} leaf - its TLAS leaf node
+	 * @param {Float32Array} world - the placement matrix pool
+	 * @param {number} offset - where this placement's matrix starts in it
+	 */
+	notePlacementMoving( leaf, world, offset ) {
+
+		if ( leaf < 0 || ! this.historyActive || this._movedPlacements.has( leaf ) ) return;
+		this._movedPlacements.set( leaf, { world, offset, prev: world.slice( offset, offset + 16 ) } );
+
+	}
+
+	// Leaves in ascending order, each with its current→previous world matrix.
+	_takeMovedPlacements() {
+
+		const moved = this._movedPlacements;
+		const upload = this._movedUpload;
+		upload.count = moved.size;
+		if ( ! moved.size ) return upload;
+
+		if ( upload.leaves.length < moved.size ) {
+
+			upload.leaves = new Uint32Array( moved.size * 2 );
+			upload.toPrev = new Float32Array( moved.size * 32 );
+
+		}
+
+		const leaves = [ ...moved.keys() ].sort( ( a, b ) => a - b );
+		for ( let i = 0; i < leaves.length; i ++ ) {
+
+			const { world, offset, prev } = moved.get( leaves[ i ] );
+			this._matB.fromArray( world, offset ).invert();
+			this._matA.fromArray( prev ).multiply( this._matB ).toArray( upload.toPrev, i * 16 );
+			upload.leaves[ i ] = leaves[ i ];
+
+		}
+
+		moved.clear();
+		return upload;
+
+	}
+
+	// What a live refresh denoises, or null for the plain accumulation.
+	_historyTextures() {
+
+		const pt = this._stages.pathTracer;
+		const history = this._history;
+		if ( ! history?.valid || this._historyDirty || ! this.historyActive || pt.isComplete ) return null;
+		if ( pt.resetCount !== this._knownResetCount ) return null;
+		if ( history.width !== this._lastRenderWidth || history.height !== this._lastRenderHeight ) return null;
+		if ( pt.frameCount <= 1 ) return history.textures;
+		if ( pt.frameCount >= HISTORY_HANDOFF_SAMPLES ) return null;
+
+		const src = this._historyInputs();
+		return src ? history.merge( src, pt.frameCount, this._historyCameraNow(), { historyScale: historyFade( pt.frameCount ) } ) : null;
+
+	}
+
+	_historyInputs() {
+
+		const pt = this._stages.pathTracer;
+		const ctx = this.pipeline?.context;
+		const backend = this.renderer?.backend;
+		if ( ! pt?.storageTextures?.readTarget || ! ctx || ! backend ) return null;
+
+		const read = pt.storageTextures.getReadTextures();
+		const gpu = ( texture ) => ( texture ? backend.get( texture )?.texture : null );
+		const src = {
+			color: gpu( read.color ),
+			albedo: gpu( read.albedo ),
+			normal: gpu( read.normalDepth ),
+			geo: gpu( ctx.getTexture( 'pathtracer:normalDepth' ) ),
+			geoPrev: gpu( ctx.getTexture( 'pathtracer:prevNormalDepth' ) ),
+			shading: gpu( ctx.getTexture( 'pathtracer:shadingNormal' ) ),
+			leaf: gpu( ctx.getTexture( 'pathtracer:instanceLeaf' ) ),
+			width: pt.width,
+			height: pt.height,
+		};
+		return src.color && src.albedo && src.normal && src.geo && src.geoPrev && src.shading && src.leaf ? src : null;
+
+	}
+
+	// The camera of the frame last traced: the path tracer's uniforms, not the live camera.
+	_historyCameraNow() {
+
+		const pt = this._stages.pathTracer;
+		this._viewProj.multiplyMatrices( pt.cameraProjectionMatrix.value, pt.cameraViewMatrix.value );
+		const camera = this._historyCamera;
+		camera.world = pt.cameraWorldMatrix.value.elements;
+		camera.projInv = pt.cameraProjectionMatrixInverse.value.elements;
+		camera.viewProj = this._viewProj.elements;
+		return camera;
+
+	}
+
+	_ensureHistory() {
+
+		this._history ??= new OIDNTemporalHistory( this.renderer.backend.device );
+		this._history.settings.cleanAux = !! this.denoiser?.expectsCleanAux( this._finalQuality );
+		return this._history;
+
+	}
+
+	_releaseHistory() {
+
+		this._history?.dispose();
+		this._history = null;
+		this._historyDirty = true;
+		this._movedPlacements.clear();
 
 	}
 
@@ -1190,6 +1437,7 @@ export class DenoisingManager extends EventDispatcher {
 
 		this._unpublishOutput();
 		this._restoreRenderDisplay();
+		this._historyDirty = true;
 
 	}
 
@@ -1203,6 +1451,7 @@ export class DenoisingManager extends EventDispatcher {
 
 		// Before the denoiser destroys the picture the Compositor would otherwise still sample.
 		this._unpublishOutput();
+		this._releaseHistory();
 
 		if ( this.denoiser ) {
 

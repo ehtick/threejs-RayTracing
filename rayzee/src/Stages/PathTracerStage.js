@@ -155,6 +155,9 @@ export class PathTracerStage extends RenderStage {
 		// Pinned back to the accumulation index in deterministic mode.
 		this._seedTick = 0;
 		this._pinSeedToFrame = false;
+		// Monotonic, unlike the seed axis; let observers tell a traced frame and a reset apart.
+		this.tracedFrames = 0;
+		this.resetCount = 0;
 
 		// Denoising management state
 		this.lastRenderMode = - 1;
@@ -635,6 +638,7 @@ export class PathTracerStage extends RenderStage {
 	 */
 	reset() {
 
+		this.resetCount ++;
 		this.frameCount = 0;
 		this.frame.value = 0;
 		this.hasPreviousAccumulated.value = 0;
